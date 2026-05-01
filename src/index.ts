@@ -92,6 +92,11 @@ program
 		"COMPLETE",
 	)
 	.option("-a, --agent <name>", "Agent name (default: ralph-wiggum)")
+	.option(
+		"-t, --iteration-timeout <seconds>",
+		"Kill kiro-cli if it produces no output for this many seconds (0 = no timeout)",
+		"0",
+	)
 	.action(loopCommand);
 
 // Cancel command

@@ -155,6 +155,7 @@ export async function runLoop(config: LoopConfig): Promise<LoopResult> {
 					scoutName: config.scoutName ?? "",
 				},
 				cwd: config.scoutCwd ?? undefined,
+				timeoutMs: config.iterationTimeoutMs > 0 ? config.iterationTimeoutMs : undefined,
 			});
 
 			if (exitCode !== 0) {

@@ -43,6 +43,13 @@ export const LoopConfigSchema = z.object({
 	 * history) instead of the shared root one.
 	 */
 	scoutCwd: z.string().nullable().default(null),
+	/**
+	 * Per-iteration timeout in milliseconds for the kiro-cli subprocess.
+	 * If kiro-cli does not exit within this time (e.g. a tool call hangs),
+	 * the process is killed and the loop moves on to the next iteration.
+	 * 0 = no timeout (default).
+	 */
+	iterationTimeoutMs: z.number().int().min(0).default(0),
 });
 
 /**

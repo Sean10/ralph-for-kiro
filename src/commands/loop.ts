@@ -21,6 +21,8 @@ interface LoopOptions {
 	completionPromise: string;
 	/** Optional agent name override */
 	agent?: string;
+	/** Per-iteration timeout in seconds, 0 for unlimited (string from CLI) */
+	iterationTimeout: string;
 }
 
 /**
@@ -42,6 +44,7 @@ export async function loopCommand(
 		maxIterations: Number.parseInt(opts.maxIterations, 10),
 		completionPromise: opts.completionPromise,
 		agentName: opts.agent ?? null,
+		iterationTimeoutMs: Number.parseInt(opts.iterationTimeout, 10) * 1000,
 	});
 
 	if (!result.success) {

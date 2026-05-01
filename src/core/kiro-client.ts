@@ -31,6 +31,13 @@ export interface RunChatOptions {
 	 * each scout runs with its own cwd and therefore its own `.kiro/`.
 	 */
 	cwd?: string;
+	/**
+	 * Timeout in milliseconds for the kiro-cli subprocess.
+	 * If the process does not exit within this time, it is killed and the
+	 * call resolves with exit code 124 (same convention as the `timeout` CLI).
+	 * Defaults to no timeout (0 = unlimited).
+	 */
+	timeoutMs?: number;
 }
 
 /**
@@ -74,6 +81,8 @@ export class KiroClient {
 	async runChat(prompt: string, options?: RunChatOptions): Promise<number> {
 		const env = buildHookEnv(options?.hookEnv);
 
+		const timeoutMs = options?.timeoutMs ?? 0;
+
 		// Pass prompt as positional argument [INPUT], not via stdin
 		const proc = Bun.spawn(
 			[
@@ -86,12 +95,45 @@ export class KiroClient {
 				prompt, // Positional argument for the input question
 			],
 			{
-				stdout: "inherit", // Show output in real-time
-				stderr: "inherit",
+				// When idle timeout is active, pipe stdout/stderr so we can detect
+				// activity. Otherwise inherit directly for real-time display.
+				stdout: timeoutMs > 0 ? "pipe" : "inherit",
+				stderr: timeoutMs > 0 ? "pipe" : "inherit",
 				env,
 				...(options?.cwd ? { cwd: options.cwd } : {}),
 			},
 		);
+
+		if (timeoutMs > 0) {
+			// Kill only when there has been NO output for timeoutMs.
+			// This avoids killing slow-but-active tasks (compilation, large file
+			// processing) while still catching truly hung tool calls.
+			let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+			const resetTimer = () => {
+				clearTimeout(idleTimer);
+				idleTimer = setTimeout(() => proc.kill(), timeoutMs);
+			};
+
+			const forward = async (
+				stream: ReadableStream<Uint8Array>,
+				dest: NodeJS.WriteStream,
+			) => {
+				for await (const chunk of stream) {
+					dest.write(chunk);
+					resetTimer();
+				}
+			};
+
+			resetTimer();
+			await Promise.all([
+				proc.stdout ? forward(proc.stdout, process.stdout) : Promise.resolve(),
+				proc.stderr ? forward(proc.stderr, process.stderr) : Promise.resolve(),
+				proc.exited,
+			]);
+			clearTimeout(idleTimer);
+			return proc.exitCode ?? 124;
+		}
 
 		await proc.exited;
 		return proc.exitCode ?? 1;
