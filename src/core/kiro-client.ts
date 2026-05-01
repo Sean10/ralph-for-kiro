@@ -41,6 +41,19 @@ export interface RunChatOptions {
 }
 
 /**
+ * Threshold for consecutive tool-validation errors before force-killing
+ * kiro-cli. When the LLM context is near capacity, kiro-cli can enter a
+ * loop of generating malformed tool calls (e.g. missing required fields).
+ * These produce stderr output, so the idle timeout never fires. This
+ * hard limit breaks the loop.
+ */
+const MAX_CONSECUTIVE_VALIDATION_ERRORS = 10;
+
+/** Regex matching kiro-cli tool-validation error messages. */
+const TOOL_VALIDATION_RE =
+	/Tool '.*' validation failed|Tool validation failed/i;
+
+/**
  * Client for interacting with kiro-cli subprocess.
  * Wraps the kiro-cli chat command with the Ralph Wiggum agent.
  */
@@ -101,36 +114,108 @@ export class KiroClient {
 				stderr: timeoutMs > 0 ? "pipe" : "inherit",
 				env,
 				...(options?.cwd ? { cwd: options.cwd } : {}),
+				// Create a new process group so we can kill kiro-cli AND all
+				// its child processes (tool subprocesses) in one signal.
+				...(timeoutMs > 0 ? { detached: true } : {}),
 			},
 		);
 
 		if (timeoutMs > 0) {
-			// Kill only when there has been NO output for timeoutMs.
-			// This avoids killing slow-but-active tasks (compilation, large file
-			// processing) while still catching truly hung tool calls.
 			let idleTimer: ReturnType<typeof setTimeout> | undefined;
+			let consecutiveErrors = 0;
+			let killed = false;
+
+			const killProcess = () => {
+				if (killed) return;
+				killed = true;
+				// Kill the entire process group (kiro-cli + child tool
+				// processes).  The negative PID targets the group created
+				// by `detached: true` above.  SIGKILL cannot be caught.
+				try {
+					process.kill(-proc.pid, "SIGKILL");
+				} catch {
+					// Process already exited — ignore
+				}
+			};
 
 			const resetTimer = () => {
 				clearTimeout(idleTimer);
-				idleTimer = setTimeout(() => proc.kill(), timeoutMs);
+				idleTimer = setTimeout(killProcess, timeoutMs);
 			};
 
-			const forward = async (
-				stream: ReadableStream<Uint8Array>,
-				dest: NodeJS.WriteStream,
-			) => {
-				for await (const chunk of stream) {
-					dest.write(chunk);
-					resetTimer();
+			// Drain stdout, forwarding to the terminal and resetting the idle
+			// timer on each chunk.  Called in the background — never blocks the
+			// return path.
+			const drainStdout = async () => {
+				if (!proc.stdout) return;
+				try {
+					for await (const chunk of proc.stdout) {
+						process.stdout.write(chunk);
+						resetTimer();
+					}
+				} catch {
+					// Stream closed after kill — expected
+				}
+			};
+
+			// Drain stderr, forwarding to the terminal.  Also watch for
+			// tool-validation error storms: when kiro-cli's LLM is near its
+			// context limit it can generate malformed tool calls in a tight
+			// loop.  These produce stderr output (so the idle timer keeps
+			// resetting) but make no forward progress.
+			const drainStderr = async () => {
+				if (!proc.stderr) return;
+				try {
+					for await (const chunk of proc.stderr) {
+						const text = new TextDecoder().decode(chunk);
+						process.stderr.write(chunk);
+
+						if (TOOL_VALIDATION_RE.test(text)) {
+							consecutiveErrors++;
+							if (consecutiveErrors >= MAX_CONSECUTIVE_VALIDATION_ERRORS) {
+								killProcess();
+								return;
+							}
+						} else {
+							consecutiveErrors = 0;
+						}
+
+						resetTimer();
+					}
+				} catch {
+					// Stream closed after kill — expected
 				}
 			};
 
 			resetTimer();
-			await Promise.all([
-				proc.stdout ? forward(proc.stdout, process.stdout) : Promise.resolve(),
-				proc.stderr ? forward(proc.stderr, process.stderr) : Promise.resolve(),
+
+			// Race: process exits naturally vs idle timeout fires.
+			// Stream draining runs in the background and does NOT block
+			// the return — this prevents the hang where `proc.exited`
+			// resolves but `forward()` is still blocked on `for await`
+			// because a child process holds the pipe open.
+			const drainPromise = Promise.all([drainStdout(), drainStderr()]);
+			await Promise.race([
 				proc.exited,
+				new Promise<void>((resolve) => {
+					const check = setInterval(() => {
+						if (killed) {
+							clearInterval(check);
+							resolve();
+						}
+					}, 100);
+				}),
 			]);
+
+			// Give streams a brief moment to flush remaining output after
+			// natural exit, then force-kill if still draining.
+			if (!killed) {
+				await Promise.race([
+					drainPromise,
+					new Promise((r) => setTimeout(r, 2000)),
+				]);
+			}
+
 			clearTimeout(idleTimer);
 			return proc.exitCode ?? 124;
 		}
